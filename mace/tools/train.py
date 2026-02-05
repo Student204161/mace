@@ -172,6 +172,8 @@ def train(
     distributed_model: Optional[DistributedDataParallel] = None,
     train_sampler: Optional[DistributedSampler] = None,
     rank: Optional[int] = 0,
+    estimated_mean: Optional[Dict[str, torch.Tensor]] = None,
+    estimated_fisher: Optional[Dict[str, torch.Tensor]] = None,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -179,7 +181,10 @@ def train(
     swa_start = True
     keep_last = False
     if log_wandb:
-        import wandb
+        try:
+            import wandb
+        except ImportError:
+            wandb = None
 
     if max_grad_norm is not None:
         logging.info(f"Using gradient clipping with tolerance={max_grad_norm:.3f}")
@@ -223,6 +228,8 @@ def train(
             swa.model.update_parameters(model)
             if epoch > start_epoch:
                 swa.scheduler.step()
+        # pylint: disable=protected-access
+        torch.cuda.memory._dump_snapshot("my_snapshot.pickle")
 
         # Train
         if distributed:
@@ -243,6 +250,8 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            estimated_mean=estimated_mean,
+            estimated_fisher=estimated_fisher,
         )
         if distributed:
             torch.distributed.barrier()
@@ -361,6 +370,8 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    estimated_mean: Optional[Dict[str, torch.Tensor]] = None,
+    estimated_fisher: Optional[Dict[str, torch.Tensor]] = None,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -392,11 +403,23 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+                estimated_mean=estimated_mean,
+                estimated_fisher=estimated_fisher,
             )
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
             if rank == 0:
                 logger.log(opt_metrics)
+
+
+def ewc_loss(model, weighting, estimated_fisher, estimated_mean):
+    losses = []
+    for param_name, param in model.named_parameters():
+        estimated_mean = estimated_mean[param_name]
+        estimated_fisher = estimated_fisher[param_name]
+        losses.append((estimated_fisher * (param - estimated_mean) ** 2).sum())
+
+    return (weighting / 2) * sum(losses)
 
 
 def take_step(
@@ -408,6 +431,8 @@ def take_step(
     output_args: Dict[str, bool],
     max_grad_norm: Optional[float],
     device: torch.device,
+    estimated_mean: Optional[Dict[str, torch.Tensor]] = None,
+    estimated_fisher: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -422,7 +447,12 @@ def take_step(
             compute_virials=output_args["virials"],
             compute_stress=output_args["stress"],
         )
-        loss = loss_fn(pred=output, ref=batch)
+        loss = loss_fn(pred=output, ref=batch) + ewc_loss(
+            model,
+            output_args["ewc_weight"],
+            estimated_mean=estimated_mean,
+            estimated_fisher=estimated_fisher,
+        )
         loss.backward()
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
@@ -538,6 +568,7 @@ def take_step_lbfgs(
 
     return loss, loss_dict
 
+
 # Keep parameters frozen/active after evaluation
 @contextmanager
 def preserve_grad_state(model):
@@ -553,6 +584,7 @@ def preserve_grad_state(model):
         for param, requires_grad in requires_grad_backup.items():
             param.requires_grad = requires_grad
 
+
 def evaluate(
     model: torch.nn.Module,
     loss_fn: torch.nn.Module,
@@ -560,7 +592,6 @@ def evaluate(
     output_args: Dict[str, bool],
     device: torch.device,
 ) -> Tuple[float, Dict[str, Any]]:
-
 
     metrics = MACELoss(loss_fn=loss_fn).to(device)
 

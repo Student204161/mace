@@ -880,6 +880,51 @@ def run(args) -> None:
                 "Please install it to use XPU device."
             )
 
+
+    if args.ewc_weight > 0: #args.ewc == True ##elastic weight consolidation
+        #https://towardsdatascience.com/continual-learning-a-deep-dive-into-elastic-weight-consolidation-loss-7cda4a2d058c/
+        def estimate_ewc_params(model, train_loader,loss_fn=loss_fn):
+            estimated_mean = {}
+
+            for param_name, param in model.named_parameters():
+                estimated_mean[param_name] = param.data.clone()
+
+            estimated_fisher = {
+                n: torch.zeros_like(p)
+                for n, p in model.named_parameters()
+            }
+
+            model.eval()
+            for batch in train_loader:
+                batch_dict = batch.to(device).to_dict()
+                model.zero_grad(set_to_none=True)
+                output = model(
+                    batch_dict,
+                    training=True,              # important: enables grads
+                    compute_force=True,
+                    compute_virials=False,
+                    compute_stress=True,
+                )
+                # https://www.inference.vc/on-empirical-fisher-information/ - more on this here
+                # if estimate_type == 'empirical':
+                #     # empirical
+                #     label = output.to(device) #output.to(device)
+                # else:
+                #     # true estimate
+                #     label = output.max(1)[1]
+
+                loss = loss_fn(pred=output, ref=batch)
+                loss.backward()
+
+                # accumulate all the gradients
+                for n, p in model.named_parameters():
+                    estimated_fisher[n].data += p.grad.data ** 2 / len(train_loader)
+            estimated_fisher = dict(estimated_fisher)
+            return estimated_mean, estimated_fisher
+        estimated_mean, estimated_fisher = estimate_ewc_params(model, train_loader)
+    else:
+        estimated_mean, estimated_fisher = None, None
+
     tools.train(
         model=model,
         loss_fn=loss_fn,
@@ -906,6 +951,8 @@ def run(args) -> None:
         plotter=plotter,
         train_sampler=train_sampler,
         rank=rank,
+        estimated_mean=estimated_mean,
+        estimated_fisher=estimated_fisher,
     )
 
     logging.info("")
